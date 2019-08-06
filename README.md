@@ -2,7 +2,7 @@
 Multithreaded Padding Oracle Attack on Oracle OAM (CVE-2018-2879)
 
 ## Authors
-Red Timmy (Marco Ortisi, Stefan Broeder, Ahmad Mahfouz)
+[Red Timmy](http://www.redtimmy.com) (Marco Ortisi, Stefan Broeder, Ahmad Mahfouz)
 
 ## Description
 This multithreaded exploit was developed to greatly increase the speed of the attack as compared to the single threaded version.
